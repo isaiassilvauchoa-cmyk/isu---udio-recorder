@@ -1,0 +1,55 @@
+{
+  "entities": {
+    "Recording": {
+      "title": "Recording",
+      "description": "Metadata and storage reference for an audio recording.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier for the recording."
+        },
+        "userId": {
+          "type": "string",
+          "description": "The UID of the user who owns the recording."
+        },
+        "userEmail": {
+          "type": "string",
+          "description": "The email of the user who owns the recording."
+        },
+        "title": {
+          "type": "string",
+          "description": "The title or filename of the recording."
+        },
+        "audioData": {
+          "type": "string",
+          "description": "Base64 encoded audio data or a URL."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The timestamp when the recording was created."
+        },
+        "duration": {
+          "type": "number",
+          "description": "The duration of the recording in milliseconds."
+        },
+        "mimeType": {
+          "type": "string",
+          "description": "The MIME type of the audio file."
+        },
+        "isPublic": {
+          "type": "boolean",
+          "description": "Whether the recording is shared publicly."
+        }
+      },
+      "required": ["userId", "title", "audioData", "createdAt", "mimeType"]
+    }
+  },
+  "firestore": {
+    "/recordings/{recordingId}": {
+      "schema": "Recording",
+      "description": "Stores user recordings for cloud sync and sharing."
+    }
+  }
+}

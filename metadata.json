@@ -1,0 +1,6 @@
+{
+  "name": "ÍSU Áudio Recorder",
+  "description": "Gravador de áudio profissional com suporte a seleção de fonte, medidor VU e interface responsiva (mobile/desktop).",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": []
+}
