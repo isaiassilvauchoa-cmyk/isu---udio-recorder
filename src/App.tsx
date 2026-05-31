@@ -26,6 +26,7 @@ import {
   FolderPlus,
   FolderOpen,
   X,
+  Sliders,
 } from "lucide-react";
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
@@ -97,8 +98,42 @@ const useAudioRecorder = (selectedFormat: "wav" | "128k" | "256k" | "320k") => {
     [],
   );
   const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
-  const [fadeDuration, setFadeDuration] = useState<number>(2);
+  const [fadeDuration, setFadeDuration] = useState<number>(0);
   const [isFadingOut, setIsFadingOut] = useState(false);
+
+  const [channelMode, setChannelMode] = useState<"stereo" | "dupe-left">(() => {
+    try {
+      const saved = localStorage.getItem("audio_channel_mode");
+      return saved === "stereo" || saved === "dupe-left" ? saved : "dupe-left";
+    } catch {
+      return "dupe-left";
+    }
+  });
+
+  const [extraBoost, setExtraBoost] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem("audio_extra_boost");
+      return saved ? parseFloat(saved) : 1.0;
+    } catch {
+      return 1.0;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("audio_channel_mode", channelMode);
+    } catch (e) {
+      console.error(e);
+    }
+  }, [channelMode]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("audio_extra_boost", extraBoost.toString());
+    } catch (e) {
+      console.error(e);
+    }
+  }, [extraBoost]);
 
   // Refs for audio processing
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -128,8 +163,8 @@ const useAudioRecorder = (selectedFormat: "wav" | "128k" | "256k" | "320k") => {
         gainValue = 1.0 + ((vol - 80) / 20) * 3.0;
       }
 
-      // Final gain with boost
-      const finalGain = gainValue * MIC_BOOST;
+      // Final gain with boost and the new channel/bluetooth preamp booster
+      const finalGain = gainValue * MIC_BOOST * extraBoost;
 
       const targetNode =
         channel === "left" ? inputGainLRef.current : inputGainRRef.current;
@@ -141,7 +176,7 @@ const useAudioRecorder = (selectedFormat: "wav" | "128k" | "256k" | "320k") => {
         );
       }
     },
-    [],
+    [extraBoost],
   );
 
   const initAudio = useCallback(async () => {
@@ -238,15 +273,21 @@ const useAudioRecorder = (selectedFormat: "wav" | "128k" | "256k" | "320k") => {
         const inputGainR = ctx.createGain();
         inputGainLRef.current = inputGainL;
         inputGainRRef.current = inputGainR;
-        // Start with the +4dB boost applied (1.585x)
-        inputGainL.gain.value = 1.585;
-        inputGainR.gain.value = 1.585;
+        // Start with the +4dB boost applied (1.585x) scaled by our Bluetooth/Extra booster
+        inputGainL.gain.value = 1.585 * extraBoost;
+        inputGainR.gain.value = 1.585 * extraBoost;
 
-        channelSplitter.connect(inputGainL, 0);
-        try {
-          channelSplitter.connect(inputGainR, 1);
-        } catch {
-          channelSplitter.connect(inputGainR, 0); // mono fallback
+        if (channelMode === "dupe-left") {
+          // Send Left channel (0) to both gain nodes. This fixes silent/quiet right channel issues on Mono/Bluetooth inputs!
+          channelSplitter.connect(inputGainL, 0);
+          channelSplitter.connect(inputGainR, 0);
+        } else {
+          channelSplitter.connect(inputGainL, 0);
+          try {
+            channelSplitter.connect(inputGainR, 1);
+          } catch {
+            channelSplitter.connect(inputGainR, 0); // mono fallback
+          }
         }
 
         const channelMerger = ctx.createChannelMerger(2);
@@ -278,10 +319,10 @@ const useAudioRecorder = (selectedFormat: "wav" | "128k" | "256k" | "320k") => {
 
         const analyserL = ctx.createAnalyser();
         const analyserR = ctx.createAnalyser();
-        analyserL.fftSize = 512;
-        analyserR.fftSize = 512;
-        analyserL.smoothingTimeConstant = 0.8;
-        analyserR.smoothingTimeConstant = 0.8;
+        analyserL.fftSize = 2048;
+        analyserR.fftSize = 2048;
+        analyserL.smoothingTimeConstant = 0.75;
+        analyserR.smoothingTimeConstant = 0.75;
 
         splitter.connect(analyserL, 0);
         // Attempt to connect right channel (fails if mic is purely mono sometimes)
@@ -338,7 +379,7 @@ const useAudioRecorder = (selectedFormat: "wav" | "128k" | "256k" | "320k") => {
       active = false;
       cancelAnimationFrame(animationFrameRef.current);
     };
-  }, [selectedDeviceId, devices.length]);
+  }, [selectedDeviceId, devices.length, channelMode, extraBoost]);
 
   const startRecording = useCallback(() => {
     console.log("startRecording clicked!", {
@@ -569,6 +610,10 @@ const useAudioRecorder = (selectedFormat: "wav" | "128k" | "256k" | "320k") => {
       }
       return null;
     },
+    channelMode,
+    setChannelMode,
+    extraBoost,
+    setExtraBoost,
   };
 };
 
@@ -753,6 +798,8 @@ const VUMeter = ({
 // === Spectrum Analyzer Component ===
 const SpectrumAnalyzer = ({ analyser }: { analyser: AnalyserNode | null }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const peaksRef = useRef<number[]>([]);
+  const peakDecayRef = useRef<number[]>([]);
 
   useEffect(() => {
     if (!analyser || !canvasRef.current) return;
@@ -766,9 +813,15 @@ const SpectrumAnalyzer = ({ analyser }: { analyser: AnalyserNode | null }) => {
     };
     resizeCanvas();
 
+    const sampleRate = analyser.context?.sampleRate || 48000;
     const bufferLength = analyser.frequencyBinCount;
     const dataArray = new Uint8Array(bufferLength);
     let animationId: number;
+
+    const fMin = 20;
+    const fMax = 20000;
+    const numBars = 31; // Exactly 31 standard 1/3-octave EQ style bands
+    const Q = 4.2; // Precise narrow frequency band selectivity Q-factor
 
     const draw = () => {
       animationId = requestAnimationFrame(draw);
@@ -779,27 +832,123 @@ const SpectrumAnalyzer = ({ analyser }: { analyser: AnalyserNode | null }) => {
 
       ctx.clearRect(0, 0, width, height);
 
-      // Draw grid
-      ctx.strokeStyle = "#27272a"; // zinc-800
-      ctx.beginPath();
-      ctx.moveTo(0, height);
-      ctx.lineTo(width, height);
-      ctx.stroke();
+      // Define responsive segment size and gap
+      const dpr = window.devicePixelRatio || 1;
+      const segmentHeight = Math.max(2, 3 * dpr);
+      const segmentGap = Math.max(1, 1 * dpr);
+      const totalSegmentHeight = segmentHeight + segmentGap;
+      const totalSegments = Math.floor(height / totalSegmentHeight);
 
-      const barWidth = Math.max(1, (width / bufferLength) * 2.5);
-      let x = 0;
+      // Initialize or scale peak buffers
+      if (peaksRef.current.length !== numBars) {
+        peaksRef.current = new Array(numBars).fill(0);
+        peakDecayRef.current = new Array(numBars).fill(0);
+      }
 
-      const gradient = ctx.createLinearGradient(0, height, 0, 0);
-      gradient.addColorStop(0, "#10b981"); // emerald
-      gradient.addColorStop(0.6, "#eab308"); // amber
-      gradient.addColorStop(1, "#ef4444"); // red
+      const peaks = peaksRef.current;
+      const peakDecay = peakDecayRef.current;
 
-      ctx.fillStyle = gradient;
+      const barWidth = width / numBars;
+      const gap = Math.max(2, barWidth * 0.15); // proportional gap for clean spacing between columns
+      const fillWidth = Math.max(1, barWidth - gap);
 
-      for (let i = 0; i < bufferLength; i++) {
-        const barHeight = (dataArray[i] / 255) * height;
-        ctx.fillRect(x, height - barHeight, barWidth - 1, barHeight);
-        x += barWidth;
+      for (let j = 0; j < numBars; j++) {
+        // Calculate logarithmic center frequency for each band
+        const fCenter = fMin * Math.pow(fMax / fMin, (j + 0.5) / numBars);
+
+        // Compute precise lower and upper boundaries utilizing Q:4.2 bandpass filter selectivity
+        const bandwidth = fCenter / Q;
+        const fStart = Math.max(fMin, fCenter - bandwidth / 2);
+        const fEnd = Math.min(fMax, fCenter + bandwidth / 2);
+
+        // Convert the frequency bounds to FFT database binary indices
+        const binStart = Math.min(bufferLength - 1, (fStart / (sampleRate / 2)) * bufferLength);
+        const binEnd = Math.min(bufferLength - 1, (fEnd / (sampleRate / 2)) * bufferLength);
+
+        let val = 0;
+        const startIdx = Math.floor(binStart);
+        const endIdx = Math.ceil(binEnd);
+
+        if (startIdx === endIdx) {
+          // If the bin range is flat (generally sub-bass levels), interpolate linearly between neighbor points
+          const tIdx = binStart - startIdx;
+          const nextIdx = Math.min(bufferLength - 1, startIdx + 1);
+          val = dataArray[startIdx] + (dataArray[nextIdx] - dataArray[startIdx]) * tIdx;
+        } else {
+          // Select peak energy to preserve high-velocity transient drumbeats and vocal sibilance
+          let maxVal = 0;
+          for (let b = startIdx; b <= endIdx; b++) {
+            if (b >= 0 && b < bufferLength) {
+              if (dataArray[b] > maxVal) {
+                maxVal = dataArray[b];
+              }
+            }
+          }
+          val = maxVal;
+        }
+
+        // Apply pre-emphasis curve to compensate for the logarithmic spectrum roll-off (making sure high-end and low-end display beautifully with extreme accuracy)
+        const centerFreq = (fStart + fEnd) / 2;
+        let correction = 1.0;
+        if (centerFreq < 100) {
+          correction = 1.35; // boost sub-bass/bass visual response
+        } else if (centerFreq < 250) {
+          correction = 1.2;  // boost lower mid-range responsivity
+        } else if (centerFreq > 4000) {
+          correction = 1.3;  // boost high frequency sparkle and sibilants which are visually quieter but high energy
+        }
+        val = Math.min(255, val * correction);
+
+        // Active segments computation
+        const valNormalized = val / 255;
+        const activeSegments = Math.round(valNormalized * (totalSegments - 1));
+        const x = j * barWidth;
+
+        // Draw background empty/inactive segments (gives high-end professional hardware aesthetic)
+        ctx.fillStyle = "rgba(39, 39, 42, 0.15)";
+        for (let s = 0; s < totalSegments; s++) {
+          const sy = height - (s + 1) * totalSegmentHeight + segmentGap;
+          ctx.fillRect(x, sy, fillWidth, segmentHeight);
+        }
+
+        // Draw active colored segments on top
+        for (let s = 0; s < activeSegments; s++) {
+          const sy = height - (s + 1) * totalSegmentHeight + segmentGap;
+          const pct = s / totalSegments;
+          if (pct < 0.6) {
+            ctx.fillStyle = "#10b981"; // emerald green (safe level)
+          } else if (pct < 0.85) {
+            ctx.fillStyle = "#eab308"; // amber/yellow (warm level)
+          } else {
+            ctx.fillStyle = "#ef4444"; // red (clipping level)
+          }
+          ctx.fillRect(x, sy, fillWidth, segmentHeight);
+        }
+
+        // Apply peak decay physics with segment coordinates
+        let peakY = peaks[j] || 0;
+        let decay = peakDecay[j] || 0;
+        const currentBarHeight = activeSegments * totalSegmentHeight;
+
+        if (currentBarHeight >= peakY) {
+          peakY = currentBarHeight;
+          decay = 0;
+        } else {
+          decay += 0.8 * dpr; // smooth gravity pulls peak indicator dot
+          peakY -= decay;
+          if (peakY < 0) peakY = 0;
+        }
+
+        peaks[j] = peakY;
+        peakDecay[j] = decay;
+
+        // Draw the peak indicator segment
+        const peakSegmentIdx = Math.floor(peakY / totalSegmentHeight);
+        if (peakSegmentIdx > 0 && peakSegmentIdx < totalSegments) {
+          const py = height - (peakSegmentIdx + 1) * totalSegmentHeight + segmentGap;
+          ctx.fillStyle = "rgba(244, 63, 94, 0.95)"; // vibrant warm rose-red peaks
+          ctx.fillRect(x, py, fillWidth, segmentHeight);
+        }
       }
     };
 
@@ -812,6 +961,37 @@ const SpectrumAnalyzer = ({ analyser }: { analyser: AnalyserNode | null }) => {
     };
   }, [analyser]);
 
+  // Utility to map tick frequencies mathematically to the correct pixel coordinates
+  const getLabelStyle = (freq: number) => {
+    const fMin = 20;
+    const fMax = 20000;
+    const t = (Math.log10(freq) - Math.log10(fMin)) / (Math.log10(fMax) - Math.log10(fMin));
+    let transform = "translateX(-50%)";
+    let left = `${t * 100}%`;
+
+    if (freq === 20) {
+      transform = "none";
+      left = "8px";
+    } else if (freq === 20000) {
+      transform = "translateX(-100%)";
+      left = "calc(100% - 8px)";
+    }
+
+    return { left, transform };
+  };
+
+  const FREQ_TICKS = [
+    { label: "20Hz", freq: 20 },
+    { label: "100", freq: 100 },
+    { label: "200", freq: 200 },
+    { label: "500", freq: 500 },
+    { label: "1K", freq: 1000 },
+    { label: "2K", freq: 2000 },
+    { label: "5K", freq: 5000 },
+    { label: "10K", freq: 10000 },
+    { label: "20K", freq: 20000 },
+  ];
+
   return (
     <div className="w-full h-full bg-black flex flex-col justify-between border-y border-zinc-800/50 relative overflow-hidden">
       <canvas
@@ -819,29 +999,33 @@ const SpectrumAnalyzer = ({ analyser }: { analyser: AnalyserNode | null }) => {
         className="absolute inset-0 w-full h-full opacity-90"
       />
 
-      {/* Frequency text positioned like the image */}
+      {/* Screen Title overlay helper */}
       <div
         className="absolute top-1 left-0 right-0 p-1 flex justify-center 
                        text-[10px] sm:text-xs text-emerald-500 font-black tracking-[0.3em] 
-                       mix-blend-screen opacity-50 z-10 pointers-none uppercase drop-shadow-md"
+                       mix-blend-screen opacity-50 z-10 pointer-events-none uppercase drop-shadow-md"
       >
-        FREQUENCY LEVELS
+        FREQUENCY LEVELS • Q: 4.2
       </div>
 
+      {/* Logarithmically distributed reference labels wrapper */}
       <div
-        className="absolute bottom-0 left-0 right-0 px-2 pb-0.5 flex flex-row justify-between 
+        className="absolute bottom-0 left-0 right-0 h-4 px-2 pb-0.5 flex flex-row
                        text-[8px] sm:text-[10px] text-zinc-400 font-bold tracking-widest 
-                       mix-blend-screen bg-black/40 z-10 pointers-none"
+                       mix-blend-screen bg-black/40 z-10 pointer-events-none"
       >
-        <span>20Hz</span>
-        <span>100</span>
-        <span>200</span>
-        <span>500</span>
-        <span>1K</span>
-        <span>2K</span>
-        <span>5K</span>
-        <span>10K</span>
-        <span>20K</span>
+        {FREQ_TICKS.map((tick) => {
+          const { left, transform } = getLabelStyle(tick.freq);
+          return (
+            <span
+              key={tick.label}
+              className="absolute"
+              style={{ left, transform }}
+            >
+              {tick.label}
+            </span>
+          );
+        })}
       </div>
     </div>
   );
@@ -901,7 +1085,29 @@ export default function App() {
     permissionError,
     selectBluetoothDevice,
     selectUSBDevice,
+    channelMode,
+    setChannelMode,
+    extraBoost,
+    setExtraBoost,
   } = useAudioRecorder(selectedFormat);
+
+  const [buttonHeight, setButtonHeight] = useState<number | null>(null);
+  const gridButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const updateHeight = () => {
+      if (gridButtonRef.current) {
+        setButtonHeight(gridButtonRef.current.offsetHeight);
+      }
+    };
+    // Run after paint
+    const timer = setTimeout(updateHeight, 150);
+    window.addEventListener("resize", updateHeight);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener("resize", updateHeight);
+    };
+  }, []);
 
   const handleSelectBT = async () => {
     const device = await selectBluetoothDevice();
@@ -1745,7 +1951,7 @@ export default function App() {
         </div>
 
         {/* Global Spectrum Analyzer */}
-        <div className="w-full shrink-0 mb-2 h-[60px] sm:mb-4 sm:h-[120px]">
+        <div className="w-full shrink-0 mb-2 h-[110px] sm:mb-4 sm:h-[200px]">
           <SpectrumAnalyzer analyser={analyser} />
         </div>
 
@@ -1753,7 +1959,7 @@ export default function App() {
         <div className="px-1 sm:px-4 mt-2 z-20 flex flex-col w-full">
           <div className="bg-zinc-900/80 border border-zinc-800 border-b-0 rounded-t-lg p-3 sm:p-6 pb-4 flex-1 mx-1 sm:mx-0">
             {activeTab === "config" && (
-              <div className="grid grid-cols-2 gap-4 sm:gap-8">
+              <div className="grid grid-cols-2 xl:grid-cols-4 gap-x-2 gap-y-4 sm:gap-8 animate-in fade-in duration-200">
                 {/* Audio Source */}
                 <div>
                   <div className="flex justify-between items-center mb-4">
@@ -1761,24 +1967,24 @@ export default function App() {
                       Fonte de Áudio
                     </h3>
                   </div>
-                  <div className="grid grid-cols-2 gap-2 sm:gap-3">
+                  <div className="grid grid-cols-2 gap-2 max-w-[180px] sm:max-w-[230px]">
                     {/* Local Mic */}
                     <button
                       onClick={handleSelectLocal}
-                      className={`flex flex-col items-center justify-center p-2 sm:p-4 rounded-xl border-2 transition-all text-center aspect-square relative ${
+                      className={`flex flex-col items-center justify-center p-1.5 rounded-xl border-2 transition-all text-center aspect-square relative ${
                         devices.some(
                           (d) =>
                             getDeviceCategory(d) === "local" &&
                             d.deviceId === selectedDeviceId,
                         )
-                          ? "border-pink-500 bg-pink-500/10 text-pink-500 z-10 shadow-[0_0_15px_rgba(236,72,153,0.5)]"
+                          ? "border-pink-500 bg-pink-500/10 text-pink-500 z-10 shadow-[0_0_8px_rgba(236,72,153,0.3)]"
                           : "border-zinc-800 bg-zinc-950/50 text-zinc-600 hover:border-pink-500/50 hover:text-pink-400"
                       }`}
                     >
-                      <div className="mb-1">
-                        <Mic size={18} />
+                      <div className="mb-0.5">
+                        <Mic size={15} />
                       </div>
-                      <span className="text-[9px] sm:text-[11px] font-black tracking-tight leading-tight uppercase">
+                      <span className="text-[8px] sm:text-[9.5px] font-black tracking-tight leading-none uppercase">
                         Mic Local
                       </span>
                       {devices.some(
@@ -1786,7 +1992,7 @@ export default function App() {
                           getDeviceCategory(d) === "local" &&
                           d.deviceId === selectedDeviceId,
                       ) && (
-                        <div className="absolute top-2 right-2">
+                        <div className="absolute top-1.5 right-1.5">
                           <div className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
                         </div>
                       )}
@@ -1795,20 +2001,20 @@ export default function App() {
                     {/* Bluetooth */}
                     <button
                       onClick={handleSelectBT}
-                      className={`flex flex-col items-center justify-center p-2 sm:p-4 rounded-xl border-2 transition-all text-center aspect-square relative ${
+                      className={`flex flex-col items-center justify-center p-1.5 rounded-xl border-2 transition-all text-center aspect-square relative ${
                         devices.some(
                           (d) =>
                             getDeviceCategory(d) === "bt" &&
                             d.deviceId === selectedDeviceId,
                         )
-                          ? "border-blue-500 bg-blue-500/10 text-blue-500 z-10 shadow-[0_0_15px_rgba(0,0,0,0.5)]"
+                          ? "border-blue-500 bg-blue-500/10 text-blue-500 z-10 shadow-[0_0_8px_rgba(59,130,246,0.3)]"
                           : "border-zinc-800 bg-zinc-950/50 text-zinc-600 hover:border-blue-500/50 hover:text-blue-400"
                       }`}
                     >
-                      <div className="mb-1">
-                        <Bluetooth size={18} />
+                      <div className="mb-0.5">
+                        <Bluetooth size={15} />
                       </div>
-                      <span className="text-[9px] sm:text-[11px] font-black tracking-tight leading-tight uppercase">
+                      <span className="text-[8px] sm:text-[9.5px] font-black tracking-tight leading-none uppercase">
                         Bluetooth
                       </span>
                       {devices.some(
@@ -1816,7 +2022,7 @@ export default function App() {
                           getDeviceCategory(d) === "bt" &&
                           d.deviceId === selectedDeviceId,
                       ) && (
-                        <div className="absolute top-2 right-2">
+                        <div className="absolute top-1.5 right-1.5">
                           <div className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
                         </div>
                       )}
@@ -1825,20 +2031,20 @@ export default function App() {
                     {/* AUX */}
                     <button
                       onClick={handleSelectAUX}
-                      className={`flex flex-col items-center justify-center p-2 sm:p-4 rounded-xl border-2 transition-all text-center aspect-square relative ${
+                      className={`flex flex-col items-center justify-center p-1.5 rounded-xl border-2 transition-all text-center aspect-square relative ${
                         devices.some(
                           (d) =>
                             getDeviceCategory(d) === "aux" &&
                             d.deviceId === selectedDeviceId,
                         )
-                          ? "border-violet-500 bg-violet-500/10 text-violet-500 z-10 shadow-[0_0_15px_rgba(139,92,246,0.5)]"
+                          ? "border-violet-500 bg-violet-500/10 text-violet-500 z-10 shadow-[0_0_8px_rgba(139,92,246,0.3)]"
                           : "border-zinc-800 bg-zinc-950/50 text-zinc-600 hover:border-violet-500/50 hover:text-violet-400"
                       }`}
                     >
-                      <div className="mb-1">
-                        <Cable size={18} />
+                      <div className="mb-0.5">
+                        <Cable size={15} />
                       </div>
-                      <span className="text-[9px] sm:text-[11px] font-black tracking-tight leading-tight uppercase">
+                      <span className="text-[8px] sm:text-[9.5px] font-black tracking-tight leading-none uppercase">
                         P2 / AUX
                       </span>
                       {devices.some(
@@ -1846,7 +2052,7 @@ export default function App() {
                           getDeviceCategory(d) === "aux" &&
                           d.deviceId === selectedDeviceId,
                       ) && (
-                        <div className="absolute top-2 right-2">
+                        <div className="absolute top-1.5 right-1.5">
                           <div className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
                         </div>
                       )}
@@ -1855,20 +2061,20 @@ export default function App() {
                     {/* USB */}
                     <button
                       onClick={handleSelectUSB}
-                      className={`flex flex-col items-center justify-center p-2 sm:p-4 rounded-xl border-2 transition-all text-center aspect-square relative ${
+                      className={`flex flex-col items-center justify-center p-1.5 rounded-xl border-2 transition-all text-center aspect-square relative ${
                         devices.some(
                           (d) =>
                             getDeviceCategory(d) === "usb" &&
                             d.deviceId === selectedDeviceId,
                         )
-                          ? "border-red-500 bg-red-500/10 text-red-500 z-10 shadow-[0_0_15px_rgba(0,0,0,0.5)]"
-                          : "border-zinc-800 bg-zinc-950/50 text-zinc-600 hover:border-red-500/50 hover:text-red-400"
+                          ? "border-red-500 bg-red-500/10 text-red-500 z-10 shadow-[0_0_8px_rgba(239,68,68,0.3)]"
+                          : "border-zinc-800 bg-zinc-950/50 text-zinc-650 hover:border-red-500/50 hover:text-red-400"
                       }`}
                     >
-                      <div className="mb-1">
-                        <Usb size={18} />
+                      <div className="mb-0.5">
+                        <Usb size={15} />
                       </div>
-                      <span className="text-[9px] sm:text-[11px] font-black tracking-tight leading-tight uppercase">
+                      <span className="text-[8px] sm:text-[9.5px] font-black tracking-tight leading-none uppercase">
                         Interface
                       </span>
                       {devices.some(
@@ -1876,7 +2082,7 @@ export default function App() {
                           getDeviceCategory(d) === "usb" &&
                           d.deviceId === selectedDeviceId,
                       ) && (
-                        <div className="absolute top-2 right-2">
+                        <div className="absolute top-1.5 right-1.5">
                           <div className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
                         </div>
                       )}
@@ -1891,66 +2097,202 @@ export default function App() {
                       Formato / Qualidade
                     </h3>
                   </div>
-                  <div className="grid grid-cols-2 gap-2 sm:gap-3">
+                  <div className="grid grid-cols-2 gap-2 max-w-[180px] sm:max-w-[230px]">
                     <button
                       onClick={() => setSelectedFormat("wav")}
-                      className={`flex flex-col items-center justify-center p-2 sm:p-4 rounded-xl border-2 transition-all text-center aspect-square ${
+                      className={`flex flex-col items-center justify-center p-1.5 rounded-xl border-2 transition-all text-center aspect-square ${
                         selectedFormat === "wav"
-                          ? "border-amber-500 bg-amber-500/5 text-amber-500 shadow-[0_0_10px_rgba(245,158,11,0.3)]"
+                          ? "border-amber-500 bg-amber-500/5 text-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.25)]"
                           : "border-zinc-800 bg-zinc-950/30 text-zinc-600 hover:border-zinc-700 hover:text-zinc-400"
                       }`}
                     >
-                      <span className="text-[9px] sm:text-[11px] font-black tracking-widest uppercase">
+                      <span className="text-[8px] sm:text-[9.5px] font-black tracking-widest uppercase">
                         WAV
                       </span>
-                      <span className="text-[8px] opacity-60 mt-1 font-medium">
+                      <span className="text-[6.5px] sm:text-[7.5px] opacity-60 mt-1 font-medium">
                         Lossless
                       </span>
                     </button>
 
                     <button
                       onClick={() => setSelectedFormat("128k")}
-                      className={`flex flex-col items-center justify-center p-2 sm:p-4 rounded-xl border-2 transition-all text-center aspect-square ${
+                      className={`flex flex-col items-center justify-center p-1.5 rounded-xl border-2 transition-all text-center aspect-square ${
                         selectedFormat === "128k"
-                          ? "border-emerald-500 bg-emerald-500/5 text-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.3)]"
+                          ? "border-emerald-500 bg-emerald-500/5 text-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.25)]"
                           : "border-zinc-800 bg-zinc-950/30 text-zinc-600 hover:border-zinc-700 hover:text-zinc-400"
                       }`}
                     >
-                      <span className="text-[9px] sm:text-[11px] font-black tracking-widest uppercase">
+                      <span className="text-[8px] sm:text-[9.5px] font-black tracking-widest uppercase">
                         128k
                       </span>
-                      <span className="text-[8px] opacity-60 mt-1 font-medium">
+                      <span className="text-[6.5px] sm:text-[7.5px] opacity-60 mt-1 font-medium">
                         MP3 (Em breve)
                       </span>
                     </button>
                     <button
                       onClick={() => setSelectedFormat("256k")}
-                      className={`flex flex-col items-center justify-center p-2 sm:p-4 rounded-xl border-2 transition-all text-center aspect-square ${
+                      className={`flex flex-col items-center justify-center p-1.5 rounded-xl border-2 transition-all text-center aspect-square ${
                         selectedFormat === "256k"
-                          ? "border-white bg-white/5 text-white shadow-[0_0_10px_rgba(255,255,255,0.3)]"
+                          ? "border-white bg-white/5 text-white shadow-[0_0_8px_rgba(255,255,255,0.25)]"
                           : "border-zinc-800 bg-zinc-950/30 text-zinc-600 hover:border-zinc-700 hover:text-zinc-400"
                       }`}
                     >
-                      <span className="text-[9px] sm:text-[11px] font-black tracking-widest uppercase">
+                      <span className="text-[8px] sm:text-[9.5px] font-black tracking-widest uppercase">
                         256k
                       </span>
-                      <span className="text-[8px] opacity-60 mt-1 font-medium">
+                      <span className="text-[6.5px] sm:text-[7.5px] opacity-60 mt-1 font-medium">
                         MP3 (Em breve)
                       </span>
                     </button>
                     <button
                       onClick={() => setSelectedFormat("320k")}
-                      className={`flex flex-col items-center justify-center p-2 sm:p-4 rounded-xl border-2 transition-all text-center aspect-square ${
+                      className={`flex flex-col items-center justify-center p-1.5 rounded-xl border-2 transition-all text-center aspect-square ${
                         selectedFormat === "320k"
-                          ? "border-rose-500 bg-rose-500/5 text-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.3)]"
+                          ? "border-rose-500 bg-rose-500/5 text-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.25)]"
                           : "border-zinc-800 bg-zinc-950/30 text-zinc-600 hover:border-zinc-700 hover:text-zinc-400"
                       }`}
                     >
-                      <span className="text-[9px] sm:text-[11px] font-black tracking-widest uppercase">
+                      <span className="text-[8px] sm:text-[9.5px] font-black tracking-widest uppercase">
                         320k
                       </span>
-                      <span className="text-[8px] opacity-60 mt-1 font-medium">
+                      <span className="text-[6.5px] sm:text-[7.5px] opacity-60 mt-1 font-medium">
                         MP3 (Em breve)
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Channel Mode Settings */}
+                <div>
+                  <div className="flex justify-between items-center mb-4">
+                    <h3 className="text-[10px] text-zinc-500 font-bold tracking-widest uppercase line-clamp-1">
+                      Modo de Canais
+                    </h3>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 max-w-[180px] sm:max-w-[230px]">
+                    <button
+                      ref={gridButtonRef}
+                      onClick={() => setChannelMode("dupe-left")}
+                      className={`flex flex-col items-center justify-center p-1.5 rounded-xl border-2 transition-all text-center aspect-square relative ${
+                        channelMode === "dupe-left"
+                          ? "border-emerald-500 bg-emerald-500/5 text-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.25)]"
+                          : "border-zinc-800 bg-zinc-950/30 text-zinc-600 hover:border-zinc-700 hover:text-zinc-400"
+                      }`}
+                      title="Grava mono/bluetooth no canal esquerdo e copia para o direito, equilibrando o som perfeitamente nos dois ouvidos e duplicando a força do sinal!"
+                    >
+                      <span className="text-[8px] sm:text-[9.5px] font-black tracking-widest uppercase leading-tight">
+                        Mono Duplo
+                      </span>
+                      <span className="text-[6.5px] sm:text-[7.5px] opacity-70 mt-1 font-extrabold text-center leading-none">
+                        Clone L ➔ R<br/>(Bluetooth/Mics)
+                      </span>
+                    </button>
+
+                    <button
+                      onClick={() => setChannelMode("stereo")}
+                      className={`flex flex-col items-center justify-center p-1.5 rounded-xl border-2 transition-all text-center aspect-square relative ${
+                        channelMode === "stereo"
+                          ? "border-blue-500 bg-blue-500/5 text-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.25)]"
+                          : "border-zinc-800 bg-zinc-950/30 text-zinc-600 hover:border-zinc-700 hover:text-zinc-400"
+                      }`}
+                      title="Grava os canais Esquerdo e Direito de forma independente (ideal para som ambiente ou instrumentos estéreo reais)."
+                    >
+                      <span className="text-[8px] sm:text-[9.5px] font-black tracking-widest uppercase leading-tight">
+                        Estéreo Real
+                      </span>
+                      <span className="text-[6.5px] sm:text-[7.5px] opacity-70 mt-1 font-extrabold text-center leading-none">
+                        L + R Separados<br/>(Multi-canal)
+                      </span>
+                    </button>
+                  </div>
+                  
+                  {/* Pasta de Arquivos - Acesso Rápido a Gravações */}
+                  <div className="mt-3 max-w-[180px] sm:max-w-[230px]">
+                    <button
+                      onClick={() => setActiveTab("recordings")}
+                      className="w-full flex flex-col items-center justify-center gap-1.5 rounded-xl border-2 border-amber-500/40 bg-amber-500/5 text-amber-500 hover:bg-amber-500/10 hover:border-amber-500 active:scale-[0.98] transition-all font-bold group cursor-pointer h-[86px] sm:h-[111px]"
+                      style={buttonHeight ? { height: `${buttonHeight}px` } : undefined}
+                      title="Pasta de Arquivos - Acesso rápido a gravações"
+                    >
+                      <FolderOpen size={18} className="text-amber-500 group-hover:scale-110 transition-transform" />
+                      <span className="text-[8.5px] sm:text-[10px] font-black tracking-widest uppercase">
+                        Gravações
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Amplifier Gain Settings */}
+                <div>
+                  <div className="flex justify-between items-center mb-4">
+                    <h3 className="text-[10px] text-zinc-500 font-bold tracking-widest uppercase line-clamp-1 flex items-center gap-1">
+                      <Sliders size={12} className="text-zinc-400" />
+                      Amplificador de Sinal
+                    </h3>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 max-w-[180px] sm:max-w-[230px]">
+                    <button
+                      onClick={() => setExtraBoost(1.0)}
+                      className={`flex flex-col items-center justify-center p-1.5 rounded-xl border-2 transition-all text-center aspect-square ${
+                        extraBoost === 1.0
+                          ? "border-zinc-300 bg-zinc-300/5 text-zinc-300 shadow-[0_0_8px_rgba(255,255,255,0.12)]"
+                          : "border-zinc-800 bg-zinc-950/30 text-zinc-650 hover:border-zinc-700 hover:text-zinc-400"
+                      }`}
+                    >
+                      <span className="text-[8px] sm:text-[9.5px] font-extrabold tracking-widest uppercase leading-none">
+                        Normal
+                      </span>
+                      <span className="text-[6.5px] sm:text-[7.5px] opacity-60 mt-1 font-mono font-bold">
+                        1x (0 dB)
+                      </span>
+                    </button>
+
+                    <button
+                      onClick={() => setExtraBoost(2.0)}
+                      className={`flex flex-col items-center justify-center p-1.5 rounded-xl border-2 transition-all text-center aspect-square ${
+                        extraBoost === 2.0
+                          ? "border-amber-500 bg-amber-500/5 text-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.25)]"
+                          : "border-zinc-800 bg-zinc-950/30 text-zinc-650 hover:border-zinc-700 hover:text-zinc-400"
+                      }`}
+                    >
+                      <span className="text-[8px] sm:text-[9.5px] font-extrabold tracking-widest uppercase leading-none">
+                        Boost x2
+                      </span>
+                      <span className="text-[6.5px] sm:text-[7.5px] opacity-60 mt-1 font-mono font-bold">
+                        2x (+6 dB)
+                      </span>
+                    </button>
+
+                    <button
+                      onClick={() => setExtraBoost(4.0)}
+                      className={`flex flex-col items-center justify-center p-1.5 rounded-xl border-2 transition-all text-center aspect-square ${
+                        extraBoost === 4.0
+                          ? "border-orange-500 bg-orange-500/5 text-orange-500 shadow-[0_0_8px_rgba(249,115,22,0.25)]"
+                          : "border-zinc-800 bg-zinc-950/30 text-zinc-650 hover:border-zinc-700 hover:text-zinc-400"
+                      }`}
+                      title="Amplificação ideal recomendada para compensar a perda dinâmica de fones e adaptadores bluetooth"
+                    >
+                      <span className="text-[8px] sm:text-[9.5px] font-black tracking-tight leading-none text-orange-400 uppercase">
+                        BOOST X4
+                      </span>
+                      <span className="text-[6.5px] sm:text-[7.5px] opacity-75 mt-1 font-bold leading-none text-orange-400/80 text-center">
+                        Indicado para<br/>Bluetooth
+                      </span>
+                    </button>
+
+                    <button
+                      onClick={() => setExtraBoost(6.0)}
+                      className={`flex flex-col items-center justify-center p-1.5 rounded-xl border-2 transition-all text-center aspect-square ${
+                        extraBoost === 6.0
+                          ? "border-rose-500 bg-rose-500/10 text-rose-500 shadow-[0_0_12px_rgba(244,63,94,0.3)]"
+                          : "border-zinc-800 bg-zinc-950/30 text-zinc-650 hover:border-zinc-700 hover:text-zinc-400"
+                      }`}
+                    >
+                      <span className="text-[8px] sm:text-[9.5px] font-extrabold tracking-widest uppercase text-rose-450 animate-pulse leading-none">
+                        MÁXIMO
+                      </span>
+                      <span className="text-[6.5px] sm:text-[7.5px] opacity-60 mt-1 font-mono font-bold">
+                        6x (+15.5dB)
                       </span>
                     </button>
                   </div>
@@ -2327,6 +2669,31 @@ export default function App() {
                       </div>
                     </div>
 
+                    {/* Inline Quick Folder Creation Banner when targetDriveFolder is not set */}
+                    {!targetDriveFolder && (
+                      <div className="bg-emerald-500/5 border border-emerald-500/20 rounded-lg p-3 flex flex-col sm:flex-row items-center justify-between gap-3 animate-in fade-in duration-200">
+                        <div className="flex items-center gap-2">
+                          <FolderPlus className="text-emerald-400 shrink-0" size={18} />
+                          <div className="text-left leading-tight">
+                            <h4 className="text-xs font-bold text-zinc-200">Criar uma pasta dedicada no Drive?</h4>
+                            <p className="text-[10px] text-zinc-450">Organize suas novas gravações em uma pasta exclusiva em seu Google Drive.</p>
+                          </div>
+                        </div>
+                        <button
+                          onClick={async () => {
+                            const folderName = window.prompt("Digite o nome da pasta no Google Drive para as gravações:", "Minhas Gravações ÍSU");
+                            if (folderName && folderName.trim()) {
+                              await createDriveFolder(folderName);
+                            }
+                          }}
+                          className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white rounded text-[9.5px] font-black uppercase tracking-widest transition-all cursor-pointer shadow-[0_0_10px_rgba(16,185,129,0.2)] flex items-center gap-1 shrink-0"
+                        >
+                          <FolderPlus size={12} />
+                          Criar Pasta de Gravações
+                        </button>
+                      </div>
+                    )}
+
                     {/* Search and Action Bar */}
                     <div className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center justify-between bg-zinc-950 p-2.5 rounded-lg border border-zinc-800">
                       <div className="relative flex-1">
@@ -2596,40 +2963,9 @@ export default function App() {
           </div>
         </div>
 
-        {/* Global Fade Controls - Persistent at bottom */}
-        <div className="px-4 sm:px-6 py-1.5 bg-zinc-950/90 border-t border-zinc-800/50 sticky bottom-0 z-30 backdrop-blur-xl mt-auto">
-          <div className="max-w-xl mx-auto">
-            <div className="flex justify-between items-center mb-1">
-              <div className="flex items-center gap-2">
-                <div className="w-2.5 h-2.5 bg-amber-500 rounded-full animate-pulse shadow-[0_0_12px_rgba(245,158,11,0.6)]"></div>
-                <span className="text-[10px] font-black text-zinc-300 tracking-widest uppercase">
-                  TRANSIÇÕES DE ÁUDIO
-                </span>
-              </div>
-              <span className="text-[10px] text-amber-500 font-black bg-amber-500/10 px-3 py-1 rounded border border-amber-500/30 uppercase tracking-tighter">
-                FADE: {fadeDuration.toFixed(1)}s
-              </span>
-            </div>
-            <div className="flex items-center gap-4">
-              <span className="text-[9px] text-zinc-600 font-black uppercase tracking-tighter">
-                OFF
-              </span>
-              <input
-                type="range"
-                min="0"
-                max="10"
-                step="0.5"
-                value={fadeDuration}
-                onChange={(e) => setFadeDuration(Number(e.target.value))}
-                className="chrome-fader flex-1"
-              />
-              <span className="text-[9px] text-zinc-600 font-black uppercase tracking-tighter">
-                10S
-              </span>
-            </div>
-          </div>
-
-          <div className="flex items-center justify-between space-x-4 mt-2 pt-2 border-t border-zinc-800/50 max-w-xl mx-auto">
+        {/* Global Bottom Status Bar */}
+        <div className="px-4 sm:px-6 py-3 bg-zinc-950/90 border-t border-zinc-800/50 sticky bottom-0 z-30 backdrop-blur-xl mt-auto animate-in fade-in duration-350">
+          <div className="flex items-center justify-between space-x-4 max-w-xl mx-auto">
             {user ? (
               <div className="flex items-center space-x-3">
                 <div className="text-left hidden sm:block">
